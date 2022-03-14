@@ -1,5 +1,6 @@
 use std::io;
 use std::io::BufRead;
+use std::str::FromStr;
 
 use rust_decimal::prelude::*;
 use std::cmp;
@@ -25,6 +26,23 @@ fn other_side(side: Side) -> Side {
         Side::Sell => Side::Buy,
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideParseError(());
+ 
+
+impl FromStr for Side {
+    type Err = SideParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s{
+            "buy"=>Ok(Side::Buy),
+            "sell"=>Ok(Side::Sell),
+            _=>Err(SideParseError(()))
+        }
+    }
+}
+ 
 
 #[derive(Copy, Clone, Debug)]
 enum TimeInForce {
@@ -93,7 +111,14 @@ enum Place {
 enum Command {
     Place(Place),
     Cancel(Uuid),
-    Flush,
+    Flush(),
+}
+
+#[derive(Debug)]
+struct CommandAtTime{
+    now:u64,
+    command:Command
+    
 }
 
 impl Order {
@@ -126,6 +151,15 @@ impl Order {
                 price: price,
                 remaining_amount: amount,
             },
+        }
+    }
+    
+    
+    fn expiry(&self)->u64{
+        match self.tif {
+            TimeInForce::IOC => self.created,
+            TimeInForce::GTC => self.created + MAX_LIFETIME,
+            TimeInForce::GTD(lifetime) => self.created + lifetime,
         }
     }
 }
@@ -171,11 +205,10 @@ fn crossed(taker: &Order, maker: &Order) -> bool {
     }
 }
 
-fn expiry(order: &Order, now: u64) -> u64 {
-    match order.tif {
-        TimeInForce::IOC => now,
-        TimeInForce::GTC => now + MAX_LIFETIME,
-        TimeInForce::GTD(lifetime) => now + lifetime,
+fn merge(r1:MatchResult, closed:HashSet<Uuid>)->MatchResult{
+    MatchResult{
+        fills:r1.fills,
+        closed:r1.closed.union(&closed).map(|u| u.clone()).collect()
     }
 }
 
@@ -234,218 +267,213 @@ impl Engine {
         }
     }
 
-    fn insert(&mut self, order: Order, now: u64) {
+    fn insert(&mut self, order: Order) {
         
-        if let Some(uuid)=self.uuid_to_side_price_time.insert(order.uuid, SidePriceTime(order.side, order.price, now)){
+        if let Some(_uuid)=self.uuid_to_side_price_time.insert(order.uuid, SidePriceTime(order.side, order.price, order.created)){
             panic!("Duplicate UUID: {}", order.uuid);
         }
         
-        self.expiry_to_uuid.insert(expiry(&order, now), order.uuid);
+        self.expiry_to_uuid.insert(order.expiry(), order.uuid);
 
         match order.side {
-            Side::Buy => self.buy.insert(PriceTime(-order.price, now), order),
-            Side::Sell => self.sell.insert(PriceTime(order.price, now), order),
+            Side::Buy => self.buy.insert(PriceTime(-order.price, order.created), order),
+            Side::Sell => self.sell.insert(PriceTime(order.price, order.created), order),
         };
     }
 
     fn place(&mut self, command: Place, now: u64) -> MatchResult {
-        assert!(now > self.last_tick, "now<= last_tick");
-
+        
         let mut order: Order = Order::create(command, now);
         let result: MatchResult = self._match(&mut order);
         if !result.closed.contains(&order.uuid) {
-            self.insert(order, now);
+            self.insert(order);
         }
         result
     }
 
-    fn cancel(&mut self, uuid: Uuid) -> MatchResult {
-        /*
-
-            Remove from uuid_to_side_price_time, get (side, price, time)
-            Remove from self.buy/self.sell using (price,time)
-            Remove from ts_to_uuid using time
-
-        */
-        if let Some(_u) = &self.pop(uuid) {
-            MatchResult {
-                closed: HashSet::from([uuid]),
-                fills: Vec::new(),
-            }
-        } else {
-            MatchResult {
-                closed: HashSet::new(),
-                fills: Vec::new(),
-            }
+    fn cancel(&mut self, uuid: Uuid) -> HashSet<Uuid>{
+        if let Some(_u) = &self.remove(uuid) {
+            HashSet::from([uuid])
+        }
+        else{
+            HashSet::new()
         }
     }
 
-    fn pop(&mut self, uuid: Uuid) -> Option<Uuid> {
+    fn remove(&mut self, uuid: Uuid) -> Option<Uuid> {
+        /*
+            Remove from uuid_to_side_price_time, get (side, price, time)
+            Remove from self.buy/self.sell using (price,time)
+            Remove from expiry_to_uuid using ?????
+        */
         let result = self.uuid_to_side_price_time.remove(&uuid);
 
         if let Some(SidePriceTime(side, price, time)) = result {
             let r = match side {
                 Side::Buy => self.buy.remove(&PriceTime(-price, time)),
                 Side::Sell => self.sell.remove(&PriceTime(price, time)),
-            };
-            assert!(r.is_some(), "Data structure mismatch");
-            //let r2=self.ts_to_uuid.remove(&time);
-            //assert!(r2.is_some(),"ts missing in ts_to_uuid");
+            }; 
+            if let Some(order) = r{
+                let expiry = order.expiry();
+                let r2=self.expiry_to_uuid.remove(&expiry);
+                assert!(r2.is_some(),"ts missing in expiry_to_uuid");
+            }
+            else{
+                panic!("Data structure mismatch")
+            }
             Some(uuid)
         } else {
             None
         }
     }
-    fn flush(&mut self, now: &u64) -> MatchResult {
-        let mut to_flush: HashSet<Uuid> = HashSet::new();
+    fn flush(&mut self, now: &u64) -> HashSet<Uuid> {
+        
+        let mut expired: HashSet<Uuid> = HashSet::new();
 
         for (expiry, uuid) in &self.expiry_to_uuid {
             if expiry <= now {
-                to_flush.insert(*uuid);
+                expired.insert(*uuid);
             } else {
                 break;
             }
         }
 
-        for uuid in &to_flush {
-            self.pop(*uuid);
+        for uuid in &expired {
+            self.remove(*uuid);
         }
-
-        MatchResult {
-            closed: to_flush,
-            fills: Vec::new(),
-        }
+        expired
     }
 
-    fn call(&mut self, cmd: Command, now: u64) -> MatchResult {
-        match cmd {
-            Command::Place(place) => self.place(place, now),
-            Command::Cancel(uuid) => self.cancel(uuid),
-            Command::Flush => self.flush(&now),
+    fn call(&mut self, command_at_time: CommandAtTime) -> MatchResult {
+        /*
+            I think we should always flush before a place or a cancel
+        */
+        let now=command_at_time.now;
+        let command = command_at_time.command;
+        
+        if now<=self.last_tick{
+            panic!("current_tick:{} must be greater than last_tick:{}",now, self.last_tick);
         }
+        let result = match command {
+            Command::Place(place) => {
+                let flushed = self.flush(&now);
+                let result = self.place(place,now);
+                merge(result, flushed)
+                
+            },
+            Command::Cancel(uuid) =>{
+                let flushed = self.flush(&now);
+                let result = MatchResult{
+                    fills:Vec::new(), 
+                    closed: self.cancel(uuid)
+                };
+                merge(result, flushed)
+                
+            },
+            Command::Flush() =>{
+                MatchResult{
+                    fills:Vec::new(),
+                    closed: self.flush(&now)
+                }
+            },
+        };
+        self.last_tick=now;
+        result
     }
 }
 
-fn apply(engine: &mut Engine, command: Command, now: u64) {
-    println!("Command: {:?}\n", command);
-    let result = engine.call(command, now);
-
-    println!("Result: {:?}\n", result);
-}
-
-fn str_to_side(s: &str) -> Side {
-    match s {
-        "buy" => Side::Buy,
-        "sell" => Side::Sell,
-        _ => panic!("Can't parse side: {}", s),
+ 
+fn time_in_force(slice:&[String])->TimeInForce{
+    let name:&str = &slice[0];
+    match name{
+        "IOC"=>TimeInForce::IOC,
+        "GTC"=>TimeInForce::GTC,
+        "GTD"=>{
+            if let Some(lifetime_s) = slice.get(1){
+                /*lifetime probably has to be >0*/
+                let lifetime=u64::from_str(lifetime_s).unwrap();
+                if lifetime<1{
+                    panic!("lifetime must be greater than zero")
+                }
+                TimeInForce::GTD(lifetime)
+            }
+            else{
+                panic!("Can't parse TIF: {}",name)
+            }
+        }
+        _=>panic!("Can't parse TIF: {}",name)
     }
 }
 
 fn limit_order_command(slice: &[String]) -> Command {
-    Command::Place(Place::LimitOrder {
-        uuid: Uuid::parse_str(&slice[0]).unwrap(),
-        side: str_to_side(&slice[1]),
+    Command::Place( Place::LimitOrder {
+        uuid: Uuid::from_str(&slice[0]).unwrap(),
+        side: Side::from_str(&slice[1]).unwrap(),
         amount: Decimal::from_str(&slice[2]).unwrap(),
         price: Decimal::from_str(&slice[3]).unwrap(),
-        tif: TimeInForce::GTC,
+        tif: time_in_force(&slice[4..])
     })
 }
 fn market_order_command(slice: &[String]) -> Command {
-    Command::Place(Place::MarketOrder {
-        uuid: Uuid::parse_str(&slice[0]).unwrap(),
-        side: str_to_side(&slice[1]),
+     Command::Place( Place::MarketOrder {
+        uuid: Uuid::from_str(&slice[0]).unwrap(),
+        side: Side::from_str(&slice[1]).unwrap(),
         amount: Decimal::from_str(&slice[2]).unwrap(),
     })
 }
-
-fn parseLine(line: String) -> Command {
-    println!("{}",line);
-    let v: Vec<String> = line.split(",").map(|s| s.to_string()).collect();
-
-    let name: &str = &v[0];
-    match name {
-        "flush" => Command::Flush,
-        "limit" => limit_order_command(&v[1..]),
-        "market" => market_order_command(&v[1..]),
-        _ => panic!("Can't parse: {}", name),
+fn cancel_command(slice:&[String])->Command{
+    if let Some(uuid_s) = slice.get(0){
+        Command::Cancel(
+            Uuid::from_str(uuid_s).unwrap()
+        )
+    }
+    else{
+        panic!("Can't parse cancel command")
     }
 }
-
-fn printResult(result:&MatchResult){
+fn parse_line(line: String) -> CommandAtTime {
+    println!("{}",line);
+    
+    /*Might be faster to avoid collect*/
+    let v: Vec<String> = line.split(",").map(|s| s.to_string()).collect();
+    
+    let now: u64 = (&v[0]).parse().unwrap();
+    let name: &str = &v[1];
+    
+    let command = match name {
+        "flush" => Command::Flush(),
+        "limit" => limit_order_command(&v[2..]),
+        "market" => market_order_command(&v[2..]),
+        "cancel"=>cancel_command(&v[2..]),
+        _ => panic!("Can't parse: {}", name),
+    };
+    
+    CommandAtTime{
+        now:now,
+        command:command
+    }
+}
+  
+fn print_result(result:&MatchResult){
     for fill in &result.fills{
-        println!("fill,{},{},{},{}",fill.maker_uuid, fill.taker_uuid, fill.base_amount, fill.price);    
+        println!("\tfill,{},{},{},{}",fill.maker_uuid, fill.taker_uuid, fill.base_amount, fill.price);    
     }
     for uuid in &result.closed{
-        println!("closed,{}",uuid);
+        println!("\tclosed,{}",uuid);
     }
-    
-    
 }
 
 fn main() {
     let mut engine = Engine::new();
     let stdin = io::stdin();
-    let mut now = 0;
-    for command in stdin
+    
+    for command_at_time in stdin
         .lock()
         .lines()
         .map(|line| line.unwrap())
-        .map(parseLine)
+        .map(parse_line)
     {
-        now += 1;
-        // apply(&mut engine, command, now);
-        let result = engine.call(command, now);
-        printResult(&result)
+        let result = engine.call(command_at_time);
+        print_result(&result)
     }
-}
-
-fn main_was() {
-    let mut engine = Engine::new();
-    let u1 = Uuid::new_v4();
-    let u2 = Uuid::new_v4();
-
-    let mut now = 1;
-    apply(
-        &mut engine,
-        Command::Place(Place::LimitOrder {
-            uuid: u1,
-            side: Side::Buy,
-            amount: Decimal::new(2, 0),
-            price: Decimal::new(100, 0),
-            tif: TimeInForce::GTC,
-        }),
-        now,
-    );
-
-    now += 1;
-    apply(
-        &mut engine,
-        Command::Place(Place::MarketOrder {
-            uuid: u2,
-            side: Side::Sell,
-            amount: Decimal::new(1, 0),
-        }),
-        now,
-    );
-
-    now += 1;
-    apply(&mut engine, Command::Cancel(u1), now);
-    now += 1;
-
-    apply(
-        &mut engine,
-        Command::Place(Place::LimitOrder {
-            uuid: u1,
-            side: Side::Buy,
-            amount: Decimal::new(2, 0),
-            price: Decimal::new(100, 0),
-            tif: TimeInForce::GTD(now + 10),
-        }),
-        now,
-    );
-
-    now += 5;
-    apply(&mut engine, Command::Flush, now);
-    now += 20;
-    apply(&mut engine, Command::Flush, now);
-}
+} 
