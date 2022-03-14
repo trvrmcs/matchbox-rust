@@ -285,6 +285,13 @@ impl Engine {
         
         let mut order: Order = Order::create(command, now);
         let result: MatchResult = self._match(&mut order);
+        
+        // Remove any closed orders from memory
+        for uuid in &result.closed{
+            self.remove(*uuid);
+        }
+        
+        //add order to resting book if not immediately closed
         if !result.closed.contains(&order.uuid) {
             self.insert(order);
         }
@@ -292,7 +299,7 @@ impl Engine {
     }
 
     fn cancel(&mut self, uuid: Uuid) -> HashSet<Uuid>{
-        if let Some(_u) = &self.remove(uuid) {
+        if  self.remove(uuid) {
             HashSet::from([uuid])
         }
         else{
@@ -300,7 +307,7 @@ impl Engine {
         }
     }
 
-    fn remove(&mut self, uuid: Uuid) -> Option<Uuid> {
+    fn remove(&mut self, uuid: Uuid) ->bool {
         /*
             Remove from uuid_to_side_price_time, get (side, price, time)
             Remove from self.buy/self.sell using (price,time)
@@ -317,13 +324,13 @@ impl Engine {
                 let expiry = order.expiry();
                 let r2=self.expiry_to_uuid.remove(&expiry);
                 assert!(r2.is_some(),"ts missing in expiry_to_uuid");
+                true
             }
             else{
                 panic!("Data structure mismatch")
-            }
-            Some(uuid)
-        } else {
-            None
+            } 
+        } else { 
+            false
         }
     }
     fn flush(&mut self, now: &u64) -> HashSet<Uuid> {
@@ -432,8 +439,6 @@ fn cancel_command(slice:&[String])->Command{
     }
 }
 fn parse_line(line: String) -> CommandAtTime {
-    println!("{}",line);
-    
     /*Might be faster to avoid collect*/
     let v: Vec<String> = line.split(",").map(|s| s.to_string()).collect();
     
@@ -454,12 +459,12 @@ fn parse_line(line: String) -> CommandAtTime {
     }
 }
   
-fn print_result(result:&MatchResult){
+fn print_result(result:&MatchResult, now:u64){
     for fill in &result.fills{
-        println!("\tfill,{},{},{},{}",fill.maker_uuid, fill.taker_uuid, fill.base_amount, fill.price);    
+        println!("< {},fill,{},{},{},{}",now,fill.maker_uuid, fill.taker_uuid, fill.base_amount, fill.price);    
     }
     for uuid in &result.closed{
-        println!("\tclosed,{}",uuid);
+        println!("< {},closed,{}",now, uuid);
     }
 }
 
@@ -467,13 +472,16 @@ fn main() {
     let mut engine = Engine::new();
     let stdin = io::stdin();
     
-    for command_at_time in stdin
+    for line in stdin
         .lock()
         .lines()
         .map(|line| line.unwrap())
-        .map(parse_line)
+        
     {
+        println!("> {}",line);
+        let command_at_time = parse_line(line);
+        let now = command_at_time.now;
         let result = engine.call(command_at_time);
-        print_result(&result)
+        print_result(&result,   now);
     }
 } 
