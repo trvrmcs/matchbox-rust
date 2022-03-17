@@ -165,6 +165,10 @@ struct PriceTime(Decimal, u64);
 struct SidePriceTime(Side, Decimal, u64);
 
 
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+struct TimeUuid(u64,Uuid);
+
+
 
 
 struct Engine {
@@ -172,7 +176,7 @@ struct Engine {
     sell: BTreeMap<PriceTime, Order>,
     last_tick: u64,
     uuid_to_side_price_time: HashMap<Uuid, SidePriceTime>,
-    expiry_to_uuid: BTreeMap<u64, Uuid>,
+    expiry_uuid:BTreeSet<TimeUuid>
 }
 
 fn crossed(taker: &Order, maker: &Order) -> bool {
@@ -243,7 +247,7 @@ impl Engine {
             sell: BTreeMap::new(),
             last_tick: 0,
             uuid_to_side_price_time: HashMap::new(),
-            expiry_to_uuid: BTreeMap::new(),
+            expiry_uuid: BTreeSet::new(),
         }
     }
 
@@ -259,7 +263,11 @@ impl Engine {
             panic!("Duplicate UUID: {}", order.uuid);
         }
 
-        self.expiry_to_uuid.insert(order.expiry(), order.uuid);
+        // self.expiry_to_uuid.insert(order.expiry(), order.uuid);
+        self.expiry_uuid.insert(
+            TimeUuid(order.expiry(), order.uuid)
+        );
+        
 
         match order.side {
             Side::Buy => self
@@ -310,8 +318,12 @@ impl Engine {
             };
             if let Some(order) = r {
                 let expiry = order.expiry();
-                let r2 = self.expiry_to_uuid.remove(&expiry);
-                assert!(r2.is_some(), "ts missing in expiry_to_uuid");
+                // let r2 = self.expiry_to_uuid.remove(&expiry);
+                
+                
+                let found = self.expiry_uuid.remove(&TimeUuid(expiry, uuid));
+                
+                assert!(found, "ts missing in expiry_to_uuid");
                 true
             } else {
                 panic!("Data structure mismatch")
@@ -323,9 +335,11 @@ impl Engine {
     fn flush(&mut self, now: &u64) -> BTreeSet<Uuid> {
         let mut expired: BTreeSet<Uuid> = BTreeSet::new();
 
-        for (expiry, uuid) in &self.expiry_to_uuid {
-            if expiry <= now {
-                expired.insert(*uuid);
+        for key in &self.expiry_uuid{
+            // key is expiry/uuid tuple struct
+        
+            if key.0 <= *now {
+                expired.insert(key.1);
             } else {
                 break;
             }
