@@ -318,12 +318,9 @@ impl Engine {
             };
             if let Some(order) = r {
                 let expiry = order.expiry();
-                // let r2 = self.expiry_to_uuid.remove(&expiry);
-                
-                
-                let found = self.expiry_uuid.remove(&TimeUuid(expiry, uuid));
-                
-                assert!(found, "ts missing in expiry_to_uuid");
+                if !self.expiry_uuid.remove(&TimeUuid(expiry, uuid)){
+                    panic!("expiry/uuid missing in expiry_uuid")
+                }
                 true
             } else {
                 panic!("Data structure mismatch")
@@ -458,6 +455,8 @@ fn parse_line(line: String) -> CommandAtTime {
 }
 
 fn print_result(result: &MatchResult, now: u64) {
+    /*
+    */
     for fill in &result.fills {
         println!(
             "< {},fill,{},{},{},{}",
@@ -480,5 +479,23 @@ fn main() {
         let now = command_at_time.now;
         let result = engine.call(command_at_time);
         print_result(&result, now);
+        //println!("no_output");
+        
+        
+        /*
+        
+            without engine.call / print_result: 
+            2.092 seconds 
+        
+            without print_result: 
+            
+            2.95 seconds
+        
+            With: 6.16 
+            
+            print a fixed string: 4.2
+            
+        
+        */
     }
 }
